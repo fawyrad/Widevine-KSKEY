@@ -1,107 +1,99 @@
 from __future__ import annotations
-from bs4 import BeautifulSoup
-import xml.etree.ElementTree as ET
-import base64
-import requests
-import uuid
-import struct
-import m3u8
-import requests, xmltodict, json
-import binascii, sys
-import string, re, time
-from io import BytesIO
-from typing import Optional, Union
-from uuid import UUID
-from xml.etree.ElementTree import XML
-import xml.etree.ElementTree as ET
 from modules.logging import setup_logging
-from modules.utils import parse_headers
-from construct import Container
-from pymp4.parser import Box
-from urllib.parse import urlparse, parse_qs
 from modules.proxy import init_proxy, allowed_countries
 from colorama import Fore, Style
+from typing import Optional
+from modules.utils import bypass_manifest_fetching
+from requests.adapters import HTTPAdapter
+import xml.etree.ElementTree as ET
+import base64, os, requests, uuid, struct, m3u8, xmltodict, json, sys, re, time
+
 
 logging = setup_logging()
 
+def used_proxy(proxy):
+    session = requests.Session()
+    if proxy:
+        session.proxies.update({
+            'http': proxy,
+            'https': proxy
+        })
+    return session
 
-def fetch_manifest(url, proxy=None, headers=None):
-    """
-    Fetches the manifest from the given URL and returns the response text.
-
-    Args:
-        url (str): The URL to fetch the manifest from.
-        proxy (dict, optional): A dictionary of proxy settings. Defaults to None.
-        headers (list, optional): Additional headers to include in the request in the format "Key: Value". Defaults to None.
-
-    Returns:
-        str: The text of the response.
-    """
+def fetch_manifest(url, proxy):
     logging.info(f"{Fore.YELLOW}Fetching manifest from URL: {Fore.RED}{url}{Fore.RESET}")
     print(Fore.MAGENTA + "=============================================================================================================")
+
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"}
+    session = used_proxy(proxy)
     
-    # Define default headers
-    default_headers = {"Origin": url, "Referer": url, "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"}
-    
-    if headers:
-        # Parse and merge user-provided headers
-        parsed_headers = parse_headers(headers)
-        default_headers.update(parsed_headers)
-        logging.info(f"{Fore.YELLOW}Headers: {Fore.RED}{parsed_headers}{Fore.RESET}")
-    
-    # Log and print headers
-    # logging.info(f"Request headers: {default_headers}")
-    # for key, value in default_headers.items():
-    #     logging.info(f"{Fore.YELLOW}Headers: {Fore.RED}{parsed_headers}{Fore.RESET}")
-    
-    # Make the HTTP request
-    response = requests.get(url, proxies=proxy, headers=default_headers)
-    response.raise_for_status()
-    
-    return response.text
+    try:
+        response = session.get(url, headers=headers)
+        response.raise_for_status()
+        return response.text
+    except requests.HTTPError as http_err:
+        if http_err.response.status_code == 403:
+            logging.info(f"{Fore.YELLOW}Forbidden - {Fore.RED}[403]: {Fore.GREEN}Attempting to bypass manifest fetching..{Fore.RESET}")
+            print(Fore.MAGENTA + "=" * 120 + "\n")
+            return bypass_manifest_fetching(url)
+        else:
+            logging.error("Failed to retrieve PSSH data using bypass method.")
+            return None
+    except requests.RequestException as e:
+        logging.error(f"An error occurred: {e}")
+        return None
 
 def extract_kid_and_pssh_from_mpd(manifest):
+    if not isinstance(manifest, str):
+        logging.error(f"Expected string or bytes-like object, got {type(manifest)}")
+        return None, None
+
     try:
-        # Define regex patterns to find the default_KID and PSSH data within the ContentProtection elements
-        kid_pattern = re.compile(r'<ContentProtection\s+.*?cenc:default_KID="(.*?)".*?>', re.DOTALL)
+        kid_pattern = re.compile(r'<ContentProtection\s+.*?cenc:default_KID="([^"]+)".*?>', re.DOTALL)
         pssh_pattern = re.compile(r'<ContentProtection\s+.*?urn:uuid:(?:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed|EDEF8BA9-79D6-4ACE-A3C8-27DCD51D21ED)".*?<cenc:pssh.*?>(.*?)</cenc:pssh>', re.DOTALL)
         
         kid_matches = kid_pattern.findall(manifest)
         pssh_matches = pssh_pattern.findall(manifest)
 
-        if kid_matches and pssh_matches:
-            logging.info(f"{Fore.YELLOW}KID: {Fore.RED}{kid_matches}")
-            print(Fore.MAGENTA + "=============================================================================================================")
-            return pssh_matches[0]
-
-        print("No KID or PSSH data found in MPD manifest.")
-        return None, None
-    except Exception as e:
-        print(f"Error extracting KID and PSSH from MPD manifest: {e}")
-        raise
-
-def get_pssh(url, proxy=None):
-    try:
-        kid, pssh = extract_kid_and_pssh(url, proxy)
-        if not pssh:
-            logging.error("No PSSH data provided or extracted.")
-            return None
-        logging.info(f"{Fore.YELLOW}KID: {Fore.RED}{kid}")
-        print(Fore.MAGENTA + "=============================================================================================================")
-        pssh_encoded = base64.b64encode(base64.b64decode(pssh)).decode('utf-8')
+        if kid_matches:
+            logging.info(f"{Fore.YELLOW}KID: {Fore.RED}{kid_matches[0]}{Fore.RESET}")
+            print(Fore.MAGENTA + "=" * 120)
+        else:
+            logging.info("No KID found in manifest.")
         
-        if not pssh_encoded:
-            logging.error("PSSH encoding failed.")
+        if pssh_matches:
+            return pssh_matches[0]
+        else:
+            logging.info("No PSSH Data found in manifest.")
             return None
-        return pssh_encoded
+
+    except Exception as e:
+        logging.error(f"Error extracting KID and PSSH from MPD manifest: {e}")
+        return None
+
+def get_pssh(url: str, proxy=None) -> Optional[str]:
+    try:
+        manifest = fetch_manifest(url, proxy)
+        if '.mpd' in url:
+            pssh = extract_kid_and_pssh_from_mpd(manifest)
+            if pssh:
+                pssh_encoded = base64.b64encode(base64.b64decode(pssh)).decode('utf-8')
+                return pssh_encoded
+        elif '.m3u8' in url:
+            m3u8_obj = fetch_m3u8(url)
+            pssh = extract_pssh_from_m3u8(m3u8_obj)
+            if pssh:
+                return pssh
+        logging.error("Unsupported manifest type or failed extraction.")
+        return None
     except Exception as e:
         logging.error(f"An error occurred: {e}")
         return None
 
-def get_pssh_from_mpd(mpd_url, proxy=None):
+def get_pssh_from_mpd(manifest_url, proxy=None):
     pssh = ''
     try:
-        r = requests.get(url=mpd_url, proxies=proxy)
+        r = requests.get(url=manifest_url, proxies=proxy)
         r.raise_for_status()
         xml = xmltodict.parse(r.text)
         mpd = json.loads(json.dumps(xml))
@@ -163,20 +155,40 @@ def pssh_parser(base64_pssh):
         return None, "Invalid Base64 input."
     
 def fetch_m3u8(url: str) -> m3u8.M3U8:
-    response = requests.get(url)
-    response.raise_for_status()
-    return m3u8.loads(response.text)
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        return m3u8.loads(response.text)
+    except requests.RequestException as e:
+        logging.error(f"Failed to fetch m3u8 playlist: {e}")
+        raise
 
-def extract_pssh_from_m3u8(m3u8_obj: m3u8.M3U8) -> str:
+def extract_pssh_from_m3u8(m3u8_obj: m3u8.M3U8) -> Optional[str]:
     keys = m3u8_obj.keys + m3u8_obj.session_keys
     for key in keys:
         if key and key.uri and key.uri.startswith('data:text/plain;base64,'):
             base64_data = key.uri.split(',')[1]
-            pssh_data = base64.b64decode(base64_data)
-            return base64.b64encode(pssh_data).decode('utf-8')
+            try:
+                pssh_data = base64.b64decode(base64_data)
+                return base64.b64encode(pssh_data).decode('utf-8')
+            except (base64.binascii.Error, ValueError) as e:
+                logging.error(f"Failed to decode Base64 data: {e}")
+                return None
     return None
 
-def extract_kid_and_pssh(url, proxy=None):
+def get_pssh_from_m3u8_url(url: str) -> Optional[str]:
+    try:
+        m3u8_obj = fetch_m3u8(url)
+        pssh = extract_pssh_from_m3u8(m3u8_obj)
+        if pssh:
+            return pssh
+        logging.error("Failed to extract PSSH from m3u8.")
+        return None
+    except Exception as e:
+        logging.error(f"An error occurred while fetching PSSH from m3u8 URL: {e}")
+        return None
+
+def extract_kid_and_pssh(url: str, proxy=None):
     manifest = fetch_manifest(url, proxy)
     if '.mpd' in url:
         return extract_kid_and_pssh_from_mpd(manifest)
